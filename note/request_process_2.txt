@@ -1,0 +1,95 @@
+
+处理任何一个request都会进行的调用过程如下：
+
+    @gen.coroutine
+    def _server_request_loop(self, delegate):
+        try:
+            while True:
+                conn = HTTP1Connection(self.stream, False,
+                                       self.params, self.context)
+                # delegate指http server
+                # start_request返回一个_ServerRequestAdapter对象，整个请求处理过程都是通过该对象进行的
+                request_delegate = delegate.start_request(self, conn)
+                try:
+                    ret = yield conn.read_response(request_delegate)
+    ...
+
+HTTP1Connection             read_response
+HTTP1Connection             _read_message
+
+
+    @gen.coroutine
+    def _read_message(self, delegate):
+            # delegate是一个_ServerRequestAdapter (httpserver.py里)对象
+            ...
+            # 读取start_line, headers
+            start_line, headers = self._parse_headers(header_data)
+            ...
+            # 将start_line, headers设置进delegate
+            header_future = delegate.headers_received(start_line, headers)
+            ...
+            # 读取request的body信息，并将其设置到delegate里
+                body_future = self._read_body(
+                    start_line.code if self.is_client else 0, headers, delegate)
+            ...
+            # 开始请求的处理过程
+            delegate.finish()
+            ...
+            
+
+class _ServerRequestAdapter(httputil.HTTPMessageDelegate):
+    """Adapts the `HTTPMessageDelegate` interface to the interface expected
+    by our clients.
+    """
+    def __init__(self, server, server_conn, request_conn):
+    	...
+    	# server指HTTPServer, server.request_callback指Application
+    	# 因此下面的方法是调用Application的start_request方法，返回一个_RequestDispatcher对象
+        self.delegate = server.request_callback.start_request(
+            server_conn, request_conn)
+        ...
+
+    def headers_received(self, start_line, headers):
+    	...
+        return self.delegate.headers_received(start_line, headers)
+
+    def data_received(self, chunk):
+    	...
+        return self.delegate.data_received(chunk)
+
+    def finish(self):
+    	...
+        self.delegate.finish()
+
+
+class _RequestDispatcher(httputil.HTTPMessageDelegate):
+    def headers_received(self, start_line, headers):
+    	...
+
+    def data_received(self, data):
+    	...
+
+    def finish(self):
+        ...
+        self.execute()
+
+    def execute(self):
+        ...
+        # handler_class的BaseClass是tornado.web.RequestHandler
+        self.handler = self.handler_class(self.application, self.request,
+                                          **self.handler_kwargs)
+        ...
+        self.handler._execute(transforms, *self.path_args,
+                              **self.path_kwargs)
+        ...
+
+
+class RequestHandler(object):
+    @gen.coroutine
+    def _execute(self, transforms, *args, **kwargs):
+        """Executes this request with the given output transforms."""
+        ...
+        # 获取要执行的方法
+        method = getattr(self, self.request.method.lower())
+        result = method(*self.path_args, **self.path_kwargs)
+        ...

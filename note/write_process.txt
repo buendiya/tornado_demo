@@ -1,0 +1,89 @@
+
+调用过程如下：
+
+RequestHandler              write
+
+class RequestHandler(object):
+    def write(self, chunk):
+        """Writes the given chunk to the output buffer.
+
+        To write the output to the network, use the flush() method below.
+        """
+        ...
+        # 只是将数据写入到_write_buffer列表里
+        self._write_buffer.append(chunk)
+
+
+参照request_process_2.md, 可知：处理请求的过程中最后会调用到RequestHandler的_execute
+
+
+class RequestHandler(object):
+    @gen.coroutine
+    def _execute(self, transforms, *args, **kwargs):
+        """Executes this request with the given output transforms."""
+        ...
+        # 获取要执行的方法
+        method = getattr(self, self.request.method.lower())
+        result = method(*self.path_args, **self.path_kwargs)
+        ...
+        self.finish()
+        ...
+
+    def finish(self, chunk=None):
+        ...
+        self.flush(include_footers=True)
+        ...
+
+    def flush(self, include_footers=False, callback=None):
+        """Flushes the current output buffer to the network.
+        """
+        ...
+        # 
+        return self.request.connection.write_headers(
+            start_line, self._headers, chunk, callback=callback)
+        ...
+
+
+class HTTP1Connection(httputil.HTTPConnection):
+
+    # 虽然method名字叫write_headers, 实际如果有chunk（即response body）有值的话，chunk会和start_line, headers一起写入
+    def write_headers(self, start_line, headers, chunk=None, callback=None):
+        """Implements `.HTTPConnection.write_headers`.
+        :arg chunk: the first (optional) chunk of data.  This is an optimization
+            so that small responses can be written in the same call as their
+            headers.
+        """
+        ...
+            if chunk:
+                data += self._format_chunk(chunk)
+            self._pending_write = self.stream.write(data)
+            self._pending_write.add_done_callback(self._on_write_complete)
+        return future
+
+
+class IOStream(BaseIOStream):
+
+    def write(self, data, callback=None):
+        """Asynchronously write the given data to this stream.
+        """
+        ...
+        self._handle_write()
+        # 如果_write_buffer里还有数据，说明在write时候有exception，则注册当前connection的write event监听回调
+        if self._write_buffer:
+            self._add_io_state(self.io_loop.WRITE)
+        ...
+
+    def _handle_write(self):
+        while self._write_buffer:
+            try:
+                ...
+                num_bytes = self.write_to_fd(self._write_buffer[0])
+                ...
+            except (socket.error, IOError, OSError) as e:
+                ...
+                return
+
+    def write_to_fd(self, data):
+        return self.socket.send(data)
+
+

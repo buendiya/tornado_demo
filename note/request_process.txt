@@ -1,0 +1,203 @@
+
+tornado处理request有两种情况：
+
+
+1. accept connection后的第一批request, 会在这批请求request都结束后注册监听connection的回调
+
+netutil                     add_accept_handler()
+TCPServer                   _handle_connection
+HTTPServer                  handle_stream
+HTTP1ServerConnection       start_serving
+HTTP1ServerConnection       _server_request_loop
+
+    @gen.coroutine
+    def _server_request_loop(self, delegate):
+        try:
+            while True:
+                conn = HTTP1Connection(self.stream, False,
+                                       self.params, self.context)
+                request_delegate = delegate.start_request(self, conn)
+                try:
+                    ret = yield conn.read_response(request_delegate)
+                except (iostream.StreamClosedError,
+                        iostream.UnsatisfiableReadError):
+                    return
+                except _QuietException:
+                    # This exception was already logged.
+                    conn.close()
+                    return
+                except Exception:
+                    gen_log.error("Uncaught exception", exc_info=True)
+                    conn.close()
+                    return
+                if not ret:
+                    return
+                yield gen.moment
+        finally:
+            delegate.on_close(self)
+
+
+可以看到，从这里开始整个监听循环，除非stream/connection关闭、有异常，才会退出监听；
+"yield gen.moment"作用：把CPU交给ioloop，然后从ioloop的callbacks里重新开始监听循环；
+"delegate.on_close(self)": 把当前connection从HTTPServer的_connections里删掉；
+
+如果read_response->_read_message是正常执行完成的，则返回的future是done的，有上述可知，则会从ioloop的callbacks里重新开始监听循环;
+如果read_response->_read_message是没有执行完成的，则返回的future是undone的，则_server_request_loop会卡在conn.read_response(request_delegate);
+
+
+
+HTTP1Connection             read_response
+HTTP1Connection             _read_message
+
+    @gen.coroutine
+    def _read_message(self, delegate):
+        need_delegate_close = False
+        try:
+            # The headers end with a blank line. After the blank line is an optional message body containing any kind of data.
+            # 尝试读取HTTP Request的 Start line + Header fields
+            header_future = self.stream.read_until_regex(
+                b"\r?\n\r?\n",
+                max_bytes=self.params.max_header_size)
+            if self.params.header_timeout is None:
+                header_data = yield header_future
+            else:
+                try:
+                    header_data = yield gen.with_timeout(
+                        self.stream.io_loop.time() + self.params.header_timeout,
+                        header_future,
+                        io_loop=self.stream.io_loop,
+                        quiet_exceptions=iostream.StreamClosedError)
+                except gen.TimeoutError:
+                    self.close()
+                    raise gen.Return(False)
+        start_line, headers = self._parse_headers(header_data)
+        ...
+
+
+header_future: 如果是有request的话，header_future是done状态的；否则是undone的，这样会使协程停止在gen.with_timeout(), 直到header_future变为done或者timeout;
+               从下面可以直到，header_future是iostream的_read_future
+               如果read_until_regex成功的话，header_future是done状态的, 同时header_future的_result是该请求的Start line + Header fields
+               因为header_future是done的，_read_message会接着往下执行
+
+
+BaseIOStream                read_until_regex
+
+    def read_until_regex(self, regex, callback=None, max_bytes=None):
+        future = self._set_read_callback(callback)      # future和self._read_future是同一个对象
+        ...
+        self._try_inline_read()
+        ...
+        return future
+
+
+    def _try_inline_read(self):
+        """Attempt to complete the current read operation from buffered data.
+        """
+        # See if we have already got the data from a previous read
+        self._run_streaming_callback()
+        pos = self._find_read_pos()
+        if pos is not None:
+            self._read_from_buffer(pos)
+            return
+        self._check_closed()
+        try:
+            pos = self._read_to_buffer_loop()       # 将请求内容读入到buffer
+        except Exception:
+            self._maybe_run_close_callback()
+            raise
+        if pos is not None:
+            self._read_from_buffer(pos)             # 把Start line + Header fields写到_read_future, 当然_read_future也就是done的
+            return
+        # We could not satisfy the read inline, so either close the stream
+        # or listen for new data.
+        # 如果pos is None, 通常此时buffer里没有数据，如果connection is still not closed, 则将当前注册回调，listen for new data
+        if self.closed():
+            self._maybe_run_close_callback()
+        else:
+            self._add_io_state(ioloop.IOLoop.READ)
+
+
+    def _add_io_state(self, state):
+        ...
+        self.io_loop.add_handler(
+            self.fileno(), self._handle_events, self._state)        # 注册监听connection的回调_handle_events
+        ...
+
+
+在client第一次向server发送请求时，连续又发送了多个请求，server会在处理玩这些请求之后，才注册对该connection的监听
+
+
+
+
+2. 非第一批request, 会触发1中注册的回调，处理request
+
+此时在有对应的request进来时，会回调_handle_events，
+在_handle_events中，会根据events类型，调用不同的函数处理. 如：events是READ类型，则调用_handle_read
+
+    def _handle_events(self, fd, events):
+        ...
+        if events & self.io_loop.READ:
+            self._handle_read()
+        ...
+
+
+    def _handle_read(self):
+        ...
+        pos = self._read_to_buffer_loop()
+        ...
+        self._read_from_buffer(pos)
+        ...
+
+
+_read_to_buffer_loop将request读入buffer, 同时返回bugger的read区的pos
+
+
+    def _read_from_buffer(self, pos):
+        ...
+        self._run_read_callback(pos, False)
+
+
+    def _run_read_callback(self, size, streaming):
+    	...
+        future = self._read_future
+        self._read_future = None
+        future.set_result(self._consume(size))
+        ...
+
+_run_read_callback会set self._read_future，也就是会将self._read_future的_done置为True, 并把Start line + Header fields写到_read_future，这将1中卡住的协程重新开始执行
+
+
+
+note: 
+undone = _done is False
+
+iostream在read(无论是哪一种read方式)时，是根据_find_read_pos来获取读到buffer哪个位置的, 可以看到它获取pos的顺序
+    def _find_read_pos(self):
+        """Attempts to find a position in the read buffer that satisfies
+        the currently-pending read.
+
+        Returns a position in the buffer if the current read can be satisfied,
+        or None if it cannot.
+        """
+        if (self._read_bytes is not None...):
+            ...
+        elif self._read_delimiter is not None:
+            ...
+        elif self._read_regex is not None:
+            ...
+        return None
+
+在每次read完成之后, 都会调用到:
+    def _read_from_buffer(self, pos):
+        """Attempts to complete the currently-pending read from the buffer.
+
+        The argument is either a position in the read buffer or None,
+        as returned by _find_read_pos.
+        """
+        self._read_bytes = self._read_delimiter = self._read_regex = None
+        self._read_partial = False
+        self._run_read_callback(pos, False)
+
+他会把这些read condition都置为None，同时调用_run_read_callback, 把读取到的信息写到_read_future里
+
+

@@ -1,0 +1,83 @@
+A.
+
+HTTPServer用_connections管理一个连接池
+当有新的request时，通过如下调用栈：
+netutil     accept_handler()   
+TCPServer   _handle_connection 
+HTTPServer  handle_stream      
+
+    def handle_stream(self, stream, address):
+        ...
+        conn = HTTP1ServerConnection(
+            stream, self.conn_params, context)
+        self._connections.add(conn)
+        ...
+生成新的connection，并将其添加到self._connections
+
+
+
+B.
+
+从self._connections中删除connection的过程如下：
+浏览器发送READ请求
+IOStream        _handle_events
+IOStream        _handle_read                    # 读取到的pos为None
+IOStream        _maybe_run_close_callback
+
+    # 会将该iostream里所有的future的done都置为True, 同时将exc_info写入future;
+    # 包括下面HTTP1ServerConnection里的_read_message里从stream里拿到的header_future(是一个read future)
+    # 因为header_future里done为True, 会使_read_message的Runner开始run; 在gen.Runner.run里尝试读取header_future的result时，就会触发StreamClosedError
+    def _maybe_run_close_callback(self):
+            ...
+            for future in futures:
+                future.set_exception(StreamClosedError(real_error=self.error))          
+            ...
+
+
+因为如下调用关系：
+
+HTTP1ServerConnection       _server_request_loop
+
+    def _server_request_loop(self, delegate):
+            while True:
+                ...
+                try:
+                    ret = yield conn.read_response(request_delegate)
+                except (iostream.StreamClosedError,
+                        iostream.UnsatisfiableReadError):
+                    return
+                ...
+        finally:
+            delegate.on_close(self)
+
+    def read_response(self, delegate):
+        ...
+        return self._read_message(delegate)
+
+    @gen.coroutine
+    def _read_message(self, delegate):
+        try:
+            header_future = self.stream.read_until_regex(
+                b"\r?\n\r?\n",
+                max_bytes=self.params.max_header_size)
+            if self.params.header_timeout is None:
+                header_data = yield header_future
+            else:
+                try:
+                    header_data = yield gen.with_timeout(
+                        self.stream.io_loop.time() + self.params.header_timeout,
+                        header_future,
+                        io_loop=self.stream.io_loop,
+                        quiet_exceptions=iostream.StreamClosedError)
+                except gen.TimeoutError:
+                    self.close()
+                    raise gen.Return(False)
+
+
+
+HTTPServer              on_close
+
+    def on_close(self, server_conn):
+        self._connections.remove(server_conn)
+
+

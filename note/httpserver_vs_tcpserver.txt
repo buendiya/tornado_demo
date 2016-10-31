@@ -1,0 +1,54 @@
+
+HTTPServer继承自TCPServer,
+
+class TCPServer(object):
+    """
+    To use `TCPServer`, define a subclass which overrides the `handle_stream`
+    method. For example, a simple echo server could be defined like this::
+    """
+    def _handle_connection(self, connection, address):
+    	...
+        future = self.handle_stream(stream, address)
+        ...
+
+因此HTTPServer的处理请求的过程也是在重载的handle_stream里实现的
+
+class HTTPServer(TCPServer, Configurable,
+                 httputil.HTTPServerConnectionDelegate):
+    def handle_stream(self, stream, address):
+        context = _HTTPRequestContext(stream, address,
+                                      self.protocol)
+        conn = HTTP1ServerConnection(
+            stream, self.conn_params, context)
+        self._connections.add(conn)
+        conn.start_serving(self)
+
+
+class HTTP1ServerConnection(object):
+    def start_serving(self, delegate):
+        """Starts serving requests on this connection.
+
+        :arg delegate: a `.HTTPServerConnectionDelegate`
+        """
+        self._serving_future = self._server_request_loop(delegate)
+
+    @gen.coroutine
+    def _server_request_loop(self, delegate):
+        try:
+            while True:
+                conn = HTTP1Connection(self.stream, False,
+                                       self.params, self.context)
+                request_delegate = delegate.start_request(self, conn)
+                try:
+                    ret = yield conn.read_response(request_delegate)
+                except (iostream.StreamClosedError,
+                        iostream.UnsatisfiableReadError):
+                ...
+                yield gen.moment
+        finally:
+            delegate.on_close(self)
+
+可以看到，HTTPServer会在handle_stream里把connection添加到_connections里，并调用conn.start_serving, 启动connection的处理循环，直到connection关闭
+和HTTP协议相关的部分的解析都是在HTTP1Connection里处理的;
+connection里对每一各request，都会生成一个单独的HTTP1Connection来进行处理
+

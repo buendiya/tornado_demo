@@ -1,0 +1,28 @@
+
+该demo是实现一个多人聊天室，大致流程如下：
+
+1.
+浏览器打开页面时，都会向server发送一起message/updates请求
+
+2.
+server接收message/updates请求，会为这个请求生成一个undone的future，并将起存在MessageBuffer的waiters里；
+此时，因为future是undone的，此时处理该connection的协程是卡在这儿的，从浏览器里可以看到updates请求一只处于pending状态
+同时有多个浏览器在访问该页面的话，也就有多个卡在这儿的协程, waiters也就有多个undone的future
+
+3.
+用户输入并post， 浏览器发送message/new请求
+
+4.
+server接收message/new请求，根据client的输入生成对应的message, 把message传回给浏览器,
+并把该message写到步骤2中waiters的所有future里，此时这些future也就变为done状态，也就会使步骤2中的所有卡住的协程继续执行
+并将waiters置为空
+
+5.
+卡住的协程继续在MessageUpdatesHandler里运行，会把4中写入到future里的message发给各浏览器
+
+6.
+各浏览器在接收到response后，把message显示出来，接着又和步骤1一样，向server发送一个message/updates请求
+然后和步骤2一样，处理该请求的协程都卡住，直到再次有用户post
+
+接着循环下去
+
